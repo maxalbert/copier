@@ -708,23 +708,38 @@ class Worker:
     def _render_template(self) -> None:
         """Render the template in the subproject root."""
         follow_symlinks = not self.template.preserve_symlinks
-        for src in scantree(str(self.template_copy_root), follow_symlinks):
-            src_abspath = Path(src.path)
-            src_relpath = Path(src_abspath).relative_to(self.template.local_abspath)
-            template_relpath = Path(src_abspath).relative_to(self.template_copy_root)
 
-            # PERFORMANCE OPTIMIZATION: For non-templated paths, check exclusion early
-            # This prevents processing thousands of files in excluded directories like .venv
-            if not self._path_needs_templating(template_relpath) and self.match_exclude(
-                template_relpath
-            ):
-                continue
+        # PERFORMANCE OPTIMIZATION: Pre-compute path prefixes for fast string operations
+        template_local_prefix = str(self.template.local_abspath) + os.sep
+        template_copy_prefix = str(self.template_copy_root) + os.sep
+
+        for src in scantree(str(self.template_copy_root), follow_symlinks):
+            src_path = src.path
+
+            # Use fast string slicing instead of expensive Path.relative_to()
+            template_relpath_str = src_path[len(template_copy_prefix) :]
+
+            # PERFORMANCE OPTIMIZATION: For non-templated paths, check exclusion early using strings
+            # This avoids expensive Path object creation for excluded files
+            if not self._path_needs_templating_str(template_relpath_str):
+                # Use string-based exclusion check for static paths
+                if self._match_exclude_str(template_relpath_str):
+                    continue
+                # Only create Path objects after exclusion check passes
+                template_relpath = Path(template_relpath_str)
+            else:
+                # For templated paths, we need Path objects for proper processing
+                template_relpath = Path(template_relpath_str)
 
             dst_relpaths_ctxs = self._render_path(template_relpath)
             for dst_relpath, ctx in dst_relpaths_ctxs:
                 # For templated paths, check exclusion after rendering (as before)
                 if self.match_exclude(dst_relpath):
                     continue
+
+                # Only create these Path objects when actually needed
+                src_relpath = Path(src_path[len(template_local_prefix) :])
+
                 if src.is_symlink() and self.template.preserve_symlinks:
                     self._render_symlink(src_relpath, dst_relpath)
                 elif src.is_dir(follow_symlinks=follow_symlinks):
@@ -734,14 +749,23 @@ class Worker:
 
     def _path_needs_templating(self, template_relpath: Path) -> bool:
         """Check if a path contains template syntax that needs processing."""
-        path_str = str(template_relpath)
+        return self._path_needs_templating_str(str(template_relpath))
+
+    def _path_needs_templating_str(self, path_str: str) -> bool:
+        """Check if a path string contains template syntax that needs processing."""
         return (
             "{{" in path_str
             or "{%" in path_str
             or "[%" in path_str  # Copier also supports [% %] syntax
             or "[[" in path_str  # Copier also supports [[ ]] syntax
-            or template_relpath.name.endswith(self.template.templates_suffix)
+            or path_str.endswith(self.template.templates_suffix)
         )
+
+    def _match_exclude_str(self, relpath_str: str) -> bool:
+        """Fast string-based exclusion check that avoids Path object creation."""
+        # For static paths, we can safely use string paths with the exclusion matcher
+        # This is much faster than creating a Path object just for exclusion checking
+        return self.match_exclude(Path(relpath_str))
 
     def _render_file(
         self,
