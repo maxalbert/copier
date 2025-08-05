@@ -705,24 +705,114 @@ class Worker:
             )
         )
 
+    def _path_needs_templating(self, path_str: str) -> bool:
+        """Check if a path likely needs template processing.
+
+        This optimization avoids expensive template processing for static paths
+        that don't contain template syntax. Only paths with Jinja2 syntax or
+        template suffixes need the full rendering pipeline.
+        """
+        return (
+            "{{" in path_str
+            or "{%" in path_str
+            or "[%" in path_str  # Copier also supports [% %] syntax
+            or "[[" in path_str  # Copier also supports [[ ]] syntax
+            or path_str.endswith(self.template.templates_suffix)
+        )
+
+    def _render_static_path(self, relpath_str: str) -> str | None:
+        """Render a static path that doesn't need template processing.
+
+        This is a fast route for static files that avoids the expensive
+        _render_parts() recursion and template compilation overhead.
+        """
+        # CRITICAL: Check if a templated sibling exists - if so, skip this file
+        # This mirrors the logic in _render_path() lines 1020-1025
+        if self.template.templates_suffix:
+            templated_sibling = (
+                self.template_copy_root
+                / f"{relpath_str}{self.template.templates_suffix}"
+            )
+            if templated_sibling.exists():
+                return None
+
+        # Handle template suffix removal for static files
+        if self.template.templates_suffix and relpath_str.endswith(
+            self.template.templates_suffix
+        ):
+            relpath_str = relpath_str[: -len(self.template.templates_suffix)]
+
+        # For static paths, no template rendering is needed
+        return relpath_str
+
     def _render_template(self) -> None:
-        """Render the template in the subproject root."""
+        """Render the template in the subproject root with smart path filtering."""
         follow_symlinks = not self.template.preserve_symlinks
+
         for src in scantree(str(self.template_copy_root), follow_symlinks):
             src_abspath = Path(src.path)
             src_relpath = Path(src_abspath).relative_to(self.template.local_abspath)
-            dst_relpaths_ctxs = self._render_path(
-                Path(src_abspath).relative_to(self.template_copy_root)
+            template_relpath = Path(src_abspath).relative_to(self.template_copy_root)
+
+            # OPTIMIZATION: Use fast route for static files, slow path for templated paths
+            if self._path_needs_templating(str(template_relpath)):
+                self._process_templated_path(
+                    src, src_relpath, template_relpath, follow_symlinks
+                )
+            else:
+                self._process_static_path(
+                    src, src_relpath, template_relpath, follow_symlinks
+                )
+
+    def _process_templated_path(
+        self,
+        src: os.DirEntry[str],
+        src_relpath: Path,
+        template_relpath: Path,
+        follow_symlinks: bool,
+    ) -> None:
+        """Process a path that needs full template processing."""
+        dst_relpaths_ctxs = self._render_path(template_relpath)
+        for dst_relpath, ctx in dst_relpaths_ctxs:
+            if self.match_exclude(dst_relpath):
+                continue
+            self._render_path_entry(src, src_relpath, dst_relpath, follow_symlinks, ctx)
+
+    def _process_static_path(
+        self,
+        src: os.DirEntry[str],
+        src_relpath: Path,
+        template_relpath: Path,
+        follow_symlinks: bool,
+    ) -> None:
+        """Process a static path using fast rendering."""
+        dst_relpath_str = self._render_static_path(str(template_relpath))
+        if dst_relpath_str is None:
+            return
+
+        dst_relpath = Path(dst_relpath_str)
+        if self.match_exclude(dst_relpath):
+            return
+
+        self._render_path_entry(src, src_relpath, dst_relpath, follow_symlinks)
+
+    def _render_path_entry(
+        self,
+        src: os.DirEntry[str],
+        src_relpath: Path,
+        dst_relpath: Path,
+        follow_symlinks: bool,
+        extra_context: AnyByStrDict | None = None,
+    ) -> None:
+        """Render a single path entry (file, directory, or symlink)."""
+        if src.is_symlink() and self.template.preserve_symlinks:
+            self._render_symlink(src_relpath, dst_relpath)
+        elif src.is_dir(follow_symlinks=follow_symlinks):
+            self._render_folder(dst_relpath)
+        else:
+            self._render_file(
+                src_relpath, dst_relpath, extra_context=extra_context or {}
             )
-            for dst_relpath, ctx in dst_relpaths_ctxs:
-                if self.match_exclude(dst_relpath):
-                    continue
-                if src.is_symlink() and self.template.preserve_symlinks:
-                    self._render_symlink(src_relpath, dst_relpath)
-                elif src.is_dir(follow_symlinks=follow_symlinks):
-                    self._render_folder(dst_relpath)
-                else:
-                    self._render_file(src_relpath, dst_relpath, extra_context=ctx or {})
 
     def _render_file(
         self,
