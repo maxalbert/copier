@@ -711,10 +711,18 @@ class Worker:
         for src in scantree(str(self.template_copy_root), follow_symlinks):
             src_abspath = Path(src.path)
             src_relpath = Path(src_abspath).relative_to(self.template.local_abspath)
-            dst_relpaths_ctxs = self._render_path(
-                Path(src_abspath).relative_to(self.template_copy_root)
-            )
+            template_relpath = Path(src_abspath).relative_to(self.template_copy_root)
+
+            # PERFORMANCE OPTIMIZATION: For non-templated paths, check exclusion early
+            # This prevents processing thousands of files in excluded directories like .venv
+            if not self._path_needs_templating(template_relpath) and self.match_exclude(
+                template_relpath
+            ):
+                continue
+
+            dst_relpaths_ctxs = self._render_path(template_relpath)
             for dst_relpath, ctx in dst_relpaths_ctxs:
+                # For templated paths, check exclusion after rendering (as before)
                 if self.match_exclude(dst_relpath):
                     continue
                 if src.is_symlink() and self.template.preserve_symlinks:
@@ -723,6 +731,17 @@ class Worker:
                     self._render_folder(dst_relpath)
                 else:
                     self._render_file(src_relpath, dst_relpath, extra_context=ctx or {})
+
+    def _path_needs_templating(self, template_relpath: Path) -> bool:
+        """Check if a path contains template syntax that needs processing."""
+        path_str = str(template_relpath)
+        return (
+            "{{" in path_str
+            or "{%" in path_str
+            or "[%" in path_str  # Copier also supports [% %] syntax
+            or "[[" in path_str  # Copier also supports [[ ]] syntax
+            or template_relpath.name.endswith(self.template.templates_suffix)
+        )
 
     def _render_file(
         self,
